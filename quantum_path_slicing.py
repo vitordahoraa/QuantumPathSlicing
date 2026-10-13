@@ -48,7 +48,7 @@ from scipy.optimize import minimize
 from classic_algorithm import (
     avaliar,
     custo_rota,
-    rota_vizinho_mais_proximo,
+    rota_inicial as construir_rota_inicial,
     simular_percurso,
     tempos_de_chegada,
     vnd,
@@ -258,6 +258,48 @@ def analise_temporal(sub_rota, instancia, t_inicial=None):
     return e, proibido_linear, proibido_par, partida
 
 
+class FatiaInviavelError(RuntimeError):
+    """Nenhuma ordem dos clientes da fatia respeita as janelas de tempo, dado
+    o relógio real na origem. Não há o que o QAOA possa resolver."""
+
+    def __init__(self, mensagem, fatia, t_origem):
+        super().__init__(mensagem)
+        self.fatia = list(fatia)
+        self.t_origem = t_origem
+
+
+def fatia_tem_permutacao_viavel(sub_rota, instancia, t_inicial=None):
+    """PRÉ-PROCESSAMENTO clássico: existe alguma ordem dos clientes livres
+    da fatia que respeite todas as janelas, inclusive a do destino fixo?
+
+    Busca em profundidade com poda por janela (exata, e barata para as
+    fatias pequenas do path-slicing). Não escolhe a ordem — só diz se existe
+    uma; a escolha entre as viáveis continua sendo do QAOA."""
+    A, B = instancia["A"], instancia["B"]
+    servico, C = instancia["servico"], instancia["C"]
+    origem, destino = sub_rota[0], sub_rota[-1]
+    livres = list(sub_rota[1:-1])
+
+    t0 = float(A[origem]) if t_inicial is None else float(t_inicial)
+    partida = max(t0, float(A[origem])) + float(servico[origem])
+
+    def chegada(t_saida, ant, prox):
+        return max(t_saida + float(C[ant, prox]), float(A[prox]))
+
+    def dfs(ant, t_saida, restantes):
+        if not restantes:
+            return chegada(t_saida, ant, destino) <= B[destino] + 1e-9
+        for c in restantes:
+            t = chegada(t_saida, ant, c)
+            if t > B[c] + 1e-9:
+                continue
+            if dfs(c, t + float(servico[c]), restantes - {c}):
+                return True
+        return False
+
+    return dfs(origem, partida, frozenset(livres))
+
+
 def escala_penalidade(sub_rota, instancia, fator=2.0):
     """Escala base das penalidades, a partir da maior aresta da fatia."""
     nos = list(sub_rota)
@@ -311,6 +353,35 @@ def construir_qubo_calibrado(sub_rota, instancia, fator_penalidade=1.3,
     return Q, n_vars, mapa, origem, pesos
 
 
+def propagar_permitidos(K, permitidos):
+    """Propagação de restrições sobre o conjunto de pares (cliente, posição)
+    ainda possíveis: se um cliente só cabe em uma posição, nenhum outro pode
+    ocupá-la; se uma posição só admite um cliente, esse cliente não pode ir
+    para outra. Repete até estabilizar. PRÉ-PROCESSAMENTO clássico: só remove
+    o que é comprovadamente impossível."""
+    permitidos = set(permitidos)
+    mudou = True
+    while mudou:
+        mudou = False
+        for i in range(K):
+            pos = [k for k in range(1, K + 1) if (i, k) in permitidos]
+            if len(pos) == 1:
+                k = pos[0]
+                for j in range(K):
+                    if j != i and (j, k) in permitidos:
+                        permitidos.discard((j, k))
+                        mudou = True
+        for k in range(1, K + 1):
+            cli = [i for i in range(K) if (i, k) in permitidos]
+            if len(cli) == 1:
+                i = cli[0]
+                for l in range(1, K + 1):
+                    if l != k and (i, l) in permitidos:
+                        permitidos.discard((i, l))
+                        mudou = True
+    return permitidos
+
+
 def construir_qubo(sub_rota, instancia, alpha=None, beta=None,
                    fator_penalidade=1.3, t_inicial=None):
     """Constrói H_Total = H_Custo + alpha*H_Fluxo + beta*H_Tempo para a
@@ -358,8 +429,27 @@ def construir_qubo(sub_rota, instancia, alpha=None, beta=None,
     if beta is None:
         beta = escala_penalidade(sub_rota, instancia, fator_penalidade)
 
+    # --- H_Tempo (parte 1): análise temporal e ELIMINAÇÃO de variáveis ------
+    e, proibido_linear, proibido_par, partida = analise_temporal(
+        sub_rota, instancia, t_inicial
+    )
+    # Cada x_{i,k} que comprovadamente não cabe é REMOVIDO do problema (em
+    # vez de ficar com uma penalidade beta): o QUBO ganha menos qubits e a
+    # faixa de energia deixa de ser dominada por penalidades, que escondiam o
+    # sinal de distância. É pré-processamento clássico da formulação; a
+    # escolha entre as ordens viáveis continua sendo do QAOA.
+    permitidos = propagar_permitidos(
+        K, {(i, k) for i in range(K) for k in range(1, K + 1)} - proibido_linear
+    )
+
+    var = {}
+    for i in range(K):
+        for k in range(1, K + 1):
+            if (i, k) in permitidos:
+                var[(i, k)] = len(var)
+
     def var_id(i, k):
-        return i * K + (k - 1)
+        return var[(i, k)]
 
     Q = {}
 
@@ -369,32 +459,28 @@ def construir_qubo(sub_rota, instancia, alpha=None, beta=None,
     # --- H_Custo -----------------------------------------------------------
     # trecho origem -> posição 1
     for i, cli in enumerate(livres):
-        soma((var_id(i, 1), var_id(i, 1)), C[origem, cli])
+        if (i, 1) in var:
+            soma((var_id(i, 1), var_id(i, 1)), C[origem, cli])
 
     # trecho posição K -> destino (o extremo fixo do outro lado)
     for i, cli in enumerate(livres):
-        soma((var_id(i, K), var_id(i, K)), C[cli, destino])
+        if (i, K) in var:
+            soma((var_id(i, K), var_id(i, K)), C[cli, destino])
 
     for k in range(1, K):
         for i, ci in enumerate(livres):
             for j, cj in enumerate(livres):
-                if i == j:
+                if i == j or (i, k) not in var or (j, k + 1) not in var:
                     continue
                 v1, v2 = var_id(i, k), var_id(j, k + 1)
                 soma((min(v1, v2), max(v1, v2)), C[ci, cj])
 
-    # --- H_Tempo -----------------------------------------------------------
-    e, proibido_linear, proibido_par, partida = analise_temporal(
-        sub_rota, instancia, t_inicial
-    )
-    penal_lineares = 0
+    # --- H_Tempo (parte 2): pares proibidos entre variáveis que sobraram ----
+    penal_lineares = len(proibido_linear)
     penal_pares = 0
-
-    for (i, k) in proibido_linear:
-        soma((var_id(i, k), var_id(i, k)), beta)
-        penal_lineares += 1
-
     for (i, k, j, l) in proibido_par:
+        if (i, k) not in var or (j, l) not in var:
+            continue  # um dos lados já foi eliminado: o par perdeu o sentido
         v1, v2 = var_id(i, k), var_id(j, l)
         soma((min(v1, v2), max(v1, v2)), beta)
         penal_pares += 1
@@ -408,28 +494,22 @@ def construir_qubo(sub_rota, instancia, alpha=None, beta=None,
                 carga[b] = carga.get(b, 0.0) + abs(coef)
         alpha = max(float(fator_penalidade) * max(carga.values(), default=0.0), 1.0)
 
-    for i in range(K):
-        for k1 in range(1, K + 1):
-            v1 = var_id(i, k1)
+    # um cliente em exatamente uma posição / uma posição com exatamente um
+    # cliente, só entre as variáveis que existem
+    grupos = [
+        [var_id(i, k) for k in range(1, K + 1) if (i, k) in var] for i in range(K)
+    ] + [
+        [var_id(i, k) for i in range(K) if (i, k) in var] for k in range(1, K + 1)
+    ]
+    for vs in grupos:
+        for v1 in vs:
             soma((v1, v1), soma_penal_linear(alpha))
-            for k2 in range(1, K + 1):
-                if k1 == k2:
-                    continue
-                v2 = var_id(i, k2)
-                soma((min(v1, v2), max(v1, v2)), alpha)
+            for v2 in vs:
+                if v1 != v2:
+                    soma((min(v1, v2), max(v1, v2)), alpha)
 
-    for k in range(1, K + 1):
-        for i1 in range(K):
-            v1 = var_id(i1, k)
-            soma((v1, v1), soma_penal_linear(alpha))
-            for i2 in range(K):
-                if i1 == i2:
-                    continue
-                v2 = var_id(i2, k)
-                soma((min(v1, v2), max(v1, v2)), alpha)
-
-    n_vars = K * K
-    mapa = {var_id(i, k): (livres[i], k) for i in range(K) for k in range(1, K + 1)}
+    n_vars = len(var)
+    mapa = {vid: (livres[i], k) for (i, k), vid in var.items()}
     pesos = dict(
         destino=destino,
         alpha=alpha,
@@ -437,6 +517,7 @@ def construir_qubo(sub_rota, instancia, alpha=None, beta=None,
         t_inicial=partida,
         penalidades_lineares=penal_lineares,
         penalidades_pares=penal_pares,
+        variaveis_eliminadas=K * K - n_vars,
     )
     return Q, n_vars, mapa, origem, pesos
 
@@ -577,9 +658,23 @@ def executar_qaoa(n_vars, h, Jm, offset, camadas=1, amostras=500,
 
     shots_otim = 0 if exato else amostras
 
+    # NORMALIZAÇÃO DO HAMILTONIANO NO CIRCUITO. Os coeficientes do QUBO
+    # chegam a centenas ou milhares (as penalidades de permutação dominam),
+    # e o circuito aplica fases 2*gamma*h. Com gamma sorteado em [0, pi] a
+    # fase dá centenas de voltas, a paisagem do valor esperado vira ruído e o
+    # COBYLA não aprende nada: medido com a distribuição exata, P(permutação
+    # válida) ficava no nível do acaso (~1%) para qualquer número de camadas.
+    # Dividir h e J por um escalar positivo não muda o ótimo nem a ordem das
+    # energias; só coloca gamma na escala em que o otimizador consegue
+    # trabalhar. O valor esperado continua sendo calculado com as energias
+    # originais.
+    escala = max(float(np.abs(h).max(initial=0.0)),
+                 float(np.abs(Jm).max(initial=0.0)), 1e-12)
+    h_circ, Jm_circ = h / escala, Jm / escala
+
     def custo_esperado(params):
         circ = montar_circuito_qaoa(
-            n_vars, h, Jm, params[:camadas], params[camadas:], camadas
+            n_vars, h_circ, Jm_circ, params[:camadas], params[camadas:], camadas
         )
         probs = np.asarray(device.run(circ, shots=shots_otim).result().values[0])
         ativos = np.flatnonzero(probs)
@@ -596,7 +691,7 @@ def executar_qaoa(n_vars, h, Jm, offset, camadas=1, amostras=500,
 
     # medição final: sempre amostrada, nunca exaustiva
     circ_final = montar_circuito_qaoa(
-        n_vars, h, Jm, res.x[:camadas], res.x[camadas:], camadas
+        n_vars, h_circ, Jm_circ, res.x[:camadas], res.x[camadas:], camadas
     )
     probs = np.asarray(device.run(circ_final, shots=amostras).result().values[0])
     medidos = np.flatnonzero(probs)
@@ -789,7 +884,7 @@ def busca_local_global(rota_completa, instancia):
 def resolver_quantico(instancia, K=4, camadas_qaoa=1, amostras=2000,
                       maxiter=40, seed=42, fator_penalidade=1.3,
                       metricas=True, exato=False, busca_local="nenhuma",
-                      verbose=True):
+                      construcao="auto", verbose=True):
     """Executa o pipeline de path-slicing sobre uma instância JÁ CARREGADA
     (o carregamento fica em main.py).
 
@@ -821,23 +916,29 @@ def resolver_quantico(instancia, K=4, camadas_qaoa=1, amostras=2000,
         )
 
     # 1) Rota inicial (heurística) + Path-Slicing
-    rota_inicial = rota_vizinho_mais_proximo(instancia)
-    fatias = path_slicing(rota_inicial, K)
+    rota_inicial, nome_construcao = construir_rota_inicial(instancia, construcao, K)
+    deposito = rota_inicial[0]
+    # O depósito entra como ÚLTIMO NÓ da rota antes de fatiar. Assim todas as
+    # fatias têm os dois extremos fixos e o mesmo tamanho (K-2 clientes
+    # livres), inclusive a final. Fatiar a rota aberta e anexar o depósito
+    # depois dava à última fatia um cliente livre a mais: 16 variáveis contra
+    # 9 nas demais, e era quase só ali que o QAOA errava o ótimo.
+    fatias = path_slicing(list(rota_inicial) + [deposito], K)
     if verbose:
-        print(f"[Q2] Rota inicial (vizinho mais próximo): {rota_inicial}")
+        print(f"[Q2] Rota inicial ({nome_construcao}): {rota_inicial}")
         print(f"     Path-slicing (K={K}): {fatias}")
 
     rota_global = [rota_inicial[0]]
+    rota_crua = [rota_inicial[0]]  # só QAOA + decodificação, sem busca local
     tempo_classico_total = 0.0
     tempo_quantico_total = 0.0
     diagnostico = []
 
-    deposito = rota_inicial[0]
     for idx_fatia, fatia in enumerate(fatias, start=1):
         ultima = idx_fatia == len(fatias)
-        # a fatia tem os DOIS extremos fixos. Para a última, o extremo final
-        # é o próprio depósito: é lá que o ciclo fecha.
-        fatia_ext = list(fatia) + [deposito] if ultima else list(fatia)
+        # a fatia tem os DOIS extremos fixos; na última, o destino é o
+        # depósito, onde o ciclo fecha.
+        fatia_ext = list(fatia)
         if verbose:
             print(
                 f"\n--- Sub-rota {idx_fatia}/{len(fatias)}: {fatia_ext} "
@@ -849,6 +950,19 @@ def resolver_quantico(instancia, K=4, camadas_qaoa=1, amostras=2000,
         # já construída, e não de a_origem: é o que permite ao H_Tempo saber
         # que horas são quando a fatia começa.
         t_origem = tempos_de_chegada(rota_global, instancia)[-1]
+        if not fatia_tem_permutacao_viavel(fatia_ext, instancia, t_origem):
+            prazos = ", ".join(
+                f"{c}(b={instancia['B'][c]:.0f})" for c in fatia_ext[1:-1]
+            )
+            raise FatiaInviavelError(
+                f"Sub-rota {idx_fatia}/{len(fatias)} {fatia_ext} é inviável: "
+                f"partindo de {fatia_ext[0]} em t={t_origem:.1f}, nenhuma ordem "
+                f"dos clientes [{prazos}] cumpre as janelas (destino "
+                f"{fatia_ext[-1]}, b={instancia['B'][fatia_ext[-1]]:.0f}). "
+                f"O problema está na rota inicial/composição das fatias, não "
+                f"no QAOA.",
+                fatia_ext, t_origem,
+            )
         Q, n_vars, mapa, origem, pesos = construir_qubo_calibrado(
             fatia_ext, instancia, fator_penalidade=fator_penalidade,
             t_inicial=t_origem,
@@ -857,6 +971,7 @@ def resolver_quantico(instancia, K=4, camadas_qaoa=1, amostras=2000,
             tempo_classico_total += time_module.time() - t0
             if not ultima:
                 rota_global.append(fatia_ext[-1])
+                rota_crua.append(fatia_ext[-1])
             continue
         h, Jm, offset = qubo_para_ising(Q, n_vars)
         tempo_classico_total += time_module.time() - t0
@@ -942,17 +1057,13 @@ def resolver_quantico(instancia, K=4, camadas_qaoa=1, amostras=2000,
             )
         )
         rota_global.extend(sub_rota_refinada)
+        rota_crua.extend(sub_rota_quantica)
         # o destino é o nó de emenda: entra agora na rota e vira a origem
         # da próxima fatia. Na última, o destino é o depósito e não entra.
         if not ultima:
             rota_global.append(fatia_ext[-1])
+            rota_crua.append(fatia_ext[-1])
 
-    # rota das fatias SEM nenhuma busca local (só QAOA + decodificação)
-    rota_crua = [rota_inicial[0]]
-    for idx, d in enumerate(diagnostico, start=1):
-        rota_crua.extend(d["sub_rota_decodificada"])
-        if idx < len(diagnostico):  # nó de emenda entre fatias
-            rota_crua.append(d["fatia"][-1])
     valor_cru = avaliar(rota_crua + [rota_crua[0]], instancia)
 
     # rota produzida pelas fatias, ANTES do refino global

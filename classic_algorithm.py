@@ -40,6 +40,7 @@ região inviável. A interrupção "de verdade" acontece só em
 simular_percurso(), que é a execução realista usada no relatório final.
 """
 
+import itertools
 import random
 import time as time_module
 
@@ -212,6 +213,210 @@ def rota_insercao_mais_barata(instancia, semente=None):
         rota = rota[:melhor_pos] + [cliente] + rota[melhor_pos:]
 
     return rota[:-1]  # devolve aberta (sem o depósito repetido no fim)
+
+
+def rota_por_prazo(instancia, chave="b"):
+    """Construção por prazo (EDD): ordena os clientes pelo fim da janela
+    b_i (ou pelo início a_i, com chave="a"). Ao contrário do vizinho mais
+    próximo, nunca deixa um cliente de prazo curto para o fim da rota."""
+    A, B = instancia["A"], instancia["B"]
+    ref = B if chave == "b" else A
+    outro = A if chave == "b" else B
+    clientes = sorted(range(1, instancia["n"]), key=lambda c: (ref[c], outro[c]))
+    return [0] + clientes
+
+
+def rota_por_fatias(instancia, K, esperas=(60.0, 120.0, 240.0, float("inf")),
+                    folga_pool=3, ramos=6, orcamento=3000):
+    """Fatiamento CONSCIENTE DAS JANELAS (pré-processamento clássico).
+
+    O path-slicing só reordena DENTRO de cada fatia: a composição das fatias
+    é herdada da rota inicial. Uma rota inicial que deixa um cliente de
+    prazo curto numa fatia tardia produz uma fatia sem nenhuma ordem viável,
+    e nada que o QAOA faça conserta isso.
+
+    Aqui a composição é decidida fatia a fatia, de modo que cada fatia
+    admita ao menos uma ordem viável:
+
+      - o pool de candidatos são os clientes ainda não atendidos de MENOR
+        folga (b_i - chegada mais cedo possível), mais 'folga_pool' extras;
+      - para cada grupo (interior + nó de emenda) testa-se, exatamente, se
+        existe ordem que respeite todas as janelas, e guarda-se o instante
+        de conclusão no PIOR caso entre as ordens viáveis — o QAOA escolhe
+        por distância, não por tempo, então só o pior caso garante que a
+        fatia seguinte continue viável;
+      - o último nó do grupo vira o nó de emenda; a ordem dos nós internos
+        aqui é só um representante — quem ordena o interior é o QAOA;
+      - se a continuação ficar inviável, volta atrás (até 'ramos'
+        alternativas por fatia e 'orcamento' expansões no total).
+
+    O depósito entra como último nó da rota ANTES de fatiar (ver
+    resolver_quantico), de modo que TODAS as fatias têm o mesmo tamanho —
+    K-2 clientes livres — inclusive a final. Antes, a final ganhava um
+    cliente livre a mais (16 variáveis contra 9) e era onde o QAOA errava.
+    'esperas' são as tolerâncias de espera tentadas em ordem (da mais
+    seletiva à irrestrita) até algum fatiamento ser achado.
+    Devolve a rota aberta, ou None se não achou fatiamento viável."""
+    A, B = instancia["A"], instancia["B"]
+    servico, C = instancia["servico"], instancia["C"]
+    n = instancia["n"]
+    m = K - 1  # nós novos por fatia intermediária
+    if m < 1 or n <= 1:
+        return None
+
+    def percorre(t_saida, ant, seq):
+        """Tempo de saída do último nó de 'seq', ou None se violar janela."""
+        t = t_saida
+        for c in seq:
+            chegada = max(t + C[ant, c], A[c])
+            if chegada > B[c] + 1e-9:
+                return None
+            t, ant = chegada + servico[c], c
+        return t
+
+    def grupos(t_saida, ant, restantes, espera):
+        # Candidatos: clientes cuja janela abre até 'espera' após a chegada
+        # mais cedo possível. Os de janela muito futura só forçariam o
+        # veículo a esperar; os flexíveis (a_i baixo, b_i alto) entram sempre
+        # — é neles que se gasta o tempo ocioso antes de janelas tardias.
+        # (Ordenar por urgência b_i ou por folga não funciona: a espera é
+        # permitida, então a folga vale ~(b_i - a_i) para quase todos, e
+        # adiar os flexíveis esgota o horizonte antes do retorno ao depósito.)
+        cand = [c for c in restantes if A[c] <= t_saida + C[ant, c] + espera]
+        if len(cand) < m:
+            cand = sorted(restantes, key=lambda c: A[c])[: m + folga_pool]
+
+        # DFS com poda por janela. A chave é (interior, nó de emenda): o nó
+        # de emenda é FIXO no QUBO e só o interior é permutado pelo QAOA.
+        # O QAOA escolhe a ordem de MENOR DISTÂNCIA, que pode terminar mais
+        # tarde que a de menor conclusão; para a fatia seguinte ficar
+        # garantidamente viável, o tempo que se propaga é o PIOR entre as
+        # ordens viáveis (tmax), e a ordem mais cedo só serve de
+        # representante na rota.
+        por_grupo = {}
+
+        def dfs(t, atual, seq):
+            if len(seq) == m:
+                chave = (frozenset(seq[:-1]), seq[-1])
+                reg = por_grupo.get(chave)
+                if reg is None:
+                    por_grupo[chave] = [t, tuple(seq), t]
+                else:
+                    if t < reg[0]:
+                        reg[0], reg[1] = t, tuple(seq)
+                    reg[2] = max(reg[2], t)
+                return
+            for c in cand:
+                if c in seq:
+                    continue
+                chegada = max(t + C[atual, c], A[c])
+                if chegada > B[c] + 1e-9:
+                    continue
+                seq.append(c)
+                dfs(chegada + servico[c], c, seq)
+                seq.pop()
+
+        dfs(t_saida, ant, [])
+
+        achados = []
+        for (interior, ult), (_, perm, tmax) in por_grupo.items():
+            # alcançabilidade (no pior caso): nenhum cliente que sobrou pode
+            # já ter perdido o prazo saindo do nó de emenda
+            usados = interior | {ult}
+            if any(tmax + C[ult, c] > B[c] + 1e-9 for c in restantes - usados):
+                continue
+            # o depósito (destino da última fatia) também precisa ser
+            # alcançável a partir do nó de emenda
+            if tmax + C[ult, 0] > B[0] + 1e-9:
+                continue
+            achados.append((tmax, perm))
+        achados.sort(key=lambda x: x[0])
+        return achados[:ramos]
+
+    gasto = [0]
+
+    def construir(t_saida, ant, restantes, espera):
+        if not restantes:
+            return []
+        gasto[0] += 1
+        if gasto[0] > orcamento:
+            return None
+        # Última fatia: o depósito é o seu destino fixo, então ela comporta
+        # no máximo K-2 clientes livres, como qualquer outra fatia. Se sobrar
+        # mais que isso, ainda é fatia intermediária e o depósito vira uma
+        # fatia final sem interior.
+        if len(restantes) <= m - 1:
+            for perm in itertools.permutations(restantes):
+                t = percorre(t_saida, ant, perm)
+                if t is None:
+                    continue
+                # t já é a saída do último cliente (chegada + serviço)
+                if t + C[perm[-1], 0] <= B[0] + 1e-9:
+                    return list(perm)
+            return None
+        for t, perm in grupos(t_saida, ant, restantes, espera):
+            resto = construir(t, perm[-1], restantes - set(perm), espera)
+            if resto is not None:
+                return list(perm) + resto
+        return None
+
+    for espera in esperas:
+        gasto[0] = 0
+        corpo = construir(
+            float(A[0]) + float(servico[0]), 0, frozenset(range(1, n)), espera
+        )
+        if corpo is not None:
+            return [0] + corpo
+    return None
+
+
+CONSTRUCOES = ("auto", "vizinho", "prazo", "inicio", "insercao", "fatias")
+
+
+def rota_inicial(instancia, construcao="auto", K=None):
+    """Rota inicial do pipeline (PRÉ-PROCESSAMENTO clássico).
+
+    'auto' constrói todas as alternativas e devolve a de menor valor
+    lexicográfico (violação, distância); as demais escolhem uma só. A
+    construção 'fatias' depende do tamanho de fatia K e só entra se K for
+    informado. Devolve (rota, nome_da_construcao)."""
+    if construcao not in CONSTRUCOES:
+        raise ValueError(f"construção inválida: {construcao!r}")
+
+    fabricas = {
+        "vizinho": rota_vizinho_mais_proximo,
+        "prazo": lambda inst: rota_por_prazo(inst, "b"),
+        "inicio": lambda inst: rota_por_prazo(inst, "a"),
+        "insercao": rota_insercao_mais_barata,
+    }
+    if K is not None:
+        fabricas["fatias"] = lambda inst: rota_por_fatias(inst, K)
+    elif construcao == "fatias":
+        raise ValueError("a construção 'fatias' exige o tamanho de fatia K")
+    nomes = list(fabricas) if construcao == "auto" else [construcao]
+
+    # Em 'auto', a construção por fatias tem prioridade quando acha solução:
+    # só ela garante que cada fatia admita uma ordem viável mesmo quando o
+    # QAOA escolhe a de menor distância. As demais olham apenas a viabilidade
+    # GLOBAL da rota e podem vencer por distância e ainda assim quebrar
+    # fatias. Elas ficam de reserva para quando 'fatias' não acha nada.
+    if construcao == "auto" and "fatias" in fabricas:
+        rota = fabricas["fatias"](instancia)
+        if rota is not None:
+            return rota, "fatias"
+        nomes = [n for n in nomes if n != "fatias"]
+
+    melhor = None
+    for nome in nomes:
+        rota = fabricas[nome](instancia)
+        if rota is None:  # construção não achou solução
+            continue
+        val = avaliar(list(rota) + [rota[0]], instancia)
+        if melhor is None or val < melhor[0]:
+            melhor = (val, rota, nome)
+    if melhor is None:
+        raise ValueError(f"a construção {construcao!r} não produziu rota")
+    return melhor[1], melhor[2]
 
 
 # ---------------------------------------------------------------------------

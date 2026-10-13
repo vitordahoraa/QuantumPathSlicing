@@ -458,6 +458,13 @@ def montar_parser():
         ),
     )
     g.add_argument(
+        "--construcao", choices=classico.CONSTRUCOES, default="auto",
+        help=(
+            "heurística da rota inicial (pré-processamento): auto = a melhor "
+            "entre vizinho, prazo, inicio e insercao (padrão)"
+        ),
+    )
+    g.add_argument(
         "--sem-metricas", dest="metricas", action="store_false",
         help="pula a enumeração exaustiva do QUBO (diagnóstico mais rápido)",
     )
@@ -525,19 +532,24 @@ def main(argv=None):
             )
             return 1
         print()
-        res_quantico = quantico.resolver_quantico(
-            instancia,
-            K=args.K,
-            camadas_qaoa=args.camadas,
-            amostras=args.amostras,
-            maxiter=args.maxiter,
-            seed=args.seed,
-            fator_penalidade=args.penalidade,
-            metricas=args.metricas,
-            exato=args.exato,
-            busca_local=args.busca_local,
-            verbose=verbose,
-        )
+        try:
+            res_quantico = quantico.resolver_quantico(
+                instancia,
+                K=args.K,
+                camadas_qaoa=args.camadas,
+                amostras=args.amostras,
+                maxiter=args.maxiter,
+                seed=args.seed,
+                fator_penalidade=args.penalidade,
+                metricas=args.metricas,
+                exato=args.exato,
+                busca_local=args.busca_local,
+                construcao=args.construcao,
+                verbose=verbose,
+            )
+        except quantico.FatiaInviavelError as exc:
+            print(f"\n[erro] {exc}", file=sys.stderr)
+            return 2
         relatar(res_quantico, instancia)
 
     # 3) Comparação
