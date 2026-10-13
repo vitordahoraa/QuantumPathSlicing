@@ -1,0 +1,15 @@
+# credenciais e configuração local (AWS) — nunca versionar
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# editores / sistema
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

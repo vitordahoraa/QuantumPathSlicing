@@ -19,6 +19,14 @@ Uso:
     python main.py --algorithm classico  --instancia benchmark/rc_201.2.txt
     python main.py --algorithm quantico  --clientes 6 --K 4 --camadas 1
 
+Ângulos do QAOA (gamma, beta):
+    sem --offline   calibra com COBYLA e salva em angulos.json
+    --offline       só LÊ os ângulos do angulos.json (erro se faltar algum)
+    --AWS           roda os circuitos no Amazon Braket (SV1) em vez do
+                    LocalSimulator; configuração no arquivo .env
+    --AWS sem --offline é o modo mais caro (o laço COBYLA roda na AWS) e
+    pede confirmação.
+
 Requisitos:
     pip install amazon-braket-sdk numpy scipy
     (o SDK do Braket só é necessário para --algorithm quantico/ambos)
@@ -53,7 +61,9 @@ import sys
 import numpy as np
 
 import classic_algorithm as classico
+import qaoa_calibracao as calibracao
 import quantum_path_slicing as quantico
+from braket_dispositivo import ConfiguracaoAwsError, criar_dispositivo
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +407,61 @@ def comparar(res_classico, res_quantico):
 
 
 # ---------------------------------------------------------------------------
+# Custo na AWS
+# ---------------------------------------------------------------------------
+
+# Tarifa do SV1 e cobrança mínima por tarefa, conforme a página de preços do
+# Amazon Braket (https://aws.amazon.com/braket/pricing/). Confira lá antes de
+# confiar na estimativa: a tarifa pode mudar.
+SV1_USD_POR_MINUTO = 0.075
+SV1_MINIMO_SEGUNDOS = 3.0
+
+
+def estimar_custo_aws(instancia, K, maxiter):
+    """Estimativa SUPERIOR do custo de calibrar na AWS: uma tarefa por
+    avaliação do COBYLA (maxiter) mais a medição final, por fatia com
+    interior, cada uma cobrada no mínimo de 3 s."""
+    n = instancia["n"]
+    fatias = (n - 2) // (K - 1) + 1 if n >= 3 else 0
+    tarefas = fatias * (maxiter + 1)
+    minutos = tarefas * SV1_MINIMO_SEGUNDOS / 60
+    return dict(
+        fatias=fatias, tarefas=tarefas, minutos=minutos,
+        usd=minutos * SV1_USD_POR_MINUTO,
+    )
+
+
+def confirmar_modo_caro(estimativa, assumir_sim=False):
+    """Aviso + confirmação do modo mais caro (--AWS sem --offline). A
+    resposta padrão (Enter) é NÃO. Sem terminal interativo não há como
+    perguntar, então recusa — a menos que --yes tenha sido passado."""
+    print("=" * 70)
+    print("[!] Este é o modo MAIS CARO: o laço COBYLA rodará no Amazon Braket.")
+    print(
+        f"    ~{estimativa['tarefas']} tarefas em {estimativa['fatias']} "
+        f"fatia(s), ~{estimativa['minutos']:.1f} min faturados, "
+        f"~US$ {estimativa['usd']:.2f} no SV1 (antes da camada gratuita)."
+    )
+    print("    Para calibrar de graça: rode sem --AWS e depois use --AWS --offline.")
+    print("=" * 70)
+    if assumir_sim:
+        print("--yes informado: confirmação dispensada.")
+        return True
+    if not sys.stdin.isatty():
+        print(
+            "[erro] Sem terminal interativo para confirmar. Use --yes para "
+            "aprovar explicitamente.",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        resposta = input("Aprova? [y/N] ")
+    except EOFError:  # entrada fechada: sem resposta é NÃO
+        return False
+    return resposta.strip().lower() in ("y", "yes", "s", "sim")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -463,6 +528,30 @@ def montar_parser():
             "heurística da rota inicial (pré-processamento): auto = a melhor "
             "entre vizinho, prazo, inicio e insercao (padrão)"
         ),
+    )
+    g.add_argument(
+        "--offline", action="store_true",
+        help=(
+            "não calibra: lê os ângulos (gamma, beta) já salvos em --angulos "
+            "e levanta erro se faltar algum. Sem esta flag, calibra com "
+            "COBYLA e salva neste arquivo"
+        ),
+    )
+    g.add_argument(
+        "--AWS", dest="aws", action="store_true",
+        help=(
+            "roda os circuitos no Amazon Braket (SV1) em vez do "
+            "LocalSimulator; configuração no .env. Sem --offline é o modo "
+            "mais caro e pede confirmação"
+        ),
+    )
+    g.add_argument(
+        "--yes", dest="yes", action="store_true",
+        help="aprova de antemão a confirmação do modo caro (--AWS sem --offline)",
+    )
+    g.add_argument(
+        "--angulos", default=calibracao.ARQUIVO_PADRAO,
+        help=f"arquivo JSON dos ângulos do QAOA (padrão: {calibracao.ARQUIVO_PADRAO})",
     )
     g.add_argument(
         "--sem-metricas", dest="metricas", action="store_false",
@@ -532,17 +621,44 @@ def main(argv=None):
             )
             return 1
         print()
+
+        # modo mais caro: o laço COBYLA rodando na AWS
+        if args.aws and not args.offline:
+            estimativa = estimar_custo_aws(instancia, args.K, args.maxiter)
+            if not confirmar_modo_caro(estimativa, assumir_sim=args.yes):
+                print("Execução cancelada.")
+                return 1
+
+        try:
+            dispositivo = criar_dispositivo(aws=args.aws)
+            if args.offline:
+                provedor = calibracao.ProvedorOffline(args.angulos, args.camadas)
+            else:
+                provedor = calibracao.ProvedorCalibracao(
+                    dispositivo, args.angulos, camadas=args.camadas,
+                    amostras=args.amostras, maxiter=args.maxiter,
+                    seed=args.seed, exato=args.exato,
+                )
+        except (ConfiguracaoAwsError, calibracao.AngulosNaoEncontradosError) as exc:
+            print(f"[erro] {exc}", file=sys.stderr)
+            return 3
+        print(f"Dispositivo: {dispositivo.nome}")
+        print(
+            "Ângulos:     "
+            + (f"lidos de {args.angulos} (offline)" if args.offline
+               else f"calibrados com COBYLA e salvos em {args.angulos}")
+        )
+        print()
+
         try:
             res_quantico = quantico.resolver_quantico(
                 instancia,
+                provedor,
+                dispositivo=dispositivo,
                 K=args.K,
-                camadas_qaoa=args.camadas,
                 amostras=args.amostras,
-                maxiter=args.maxiter,
-                seed=args.seed,
                 fator_penalidade=args.penalidade,
                 metricas=args.metricas,
-                exato=args.exato,
                 busca_local=args.busca_local,
                 construcao=args.construcao,
                 verbose=verbose,
@@ -550,6 +666,9 @@ def main(argv=None):
         except quantico.FatiaInviavelError as exc:
             print(f"\n[erro] {exc}", file=sys.stderr)
             return 2
+        except calibracao.AngulosNaoEncontradosError as exc:
+            print(f"\n[erro] {exc}", file=sys.stderr)
+            return 3
         relatar(res_quantico, instancia)
 
     # 3) Comparação

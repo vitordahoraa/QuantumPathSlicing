@@ -5,9 +5,12 @@ Abordagem híbrida quântica de busca local para o TSPTW, seguindo a
 arquitetura do TCC:
 
     Path-Slicing -> Tradutor QUBO -> Execução Quântica (QAOA no Amazon
-    Braket LocalSimulator) -> Pós-processamento (busca local) -> Análise
+    Braket: LocalSimulator ou AWS) -> Pós-processamento (busca local) -> Análise
 
-Toda a lógica QUÂNTICA vive neste módulo. A avaliação de soluções
+Toda a lógica QUÂNTICA vive neste módulo. A obtenção dos ângulos (gamma,
+beta) do QAOA — a única parte com otimizador clássico — fica FORA dele, em
+qaoa_calibracao.py: aqui só se monta o circuito com ângulos já definidos e
+se mede. A avaliação de soluções
 (distância, janelas de tempo, simulação do percurso) e as vizinhanças de
 busca local são importadas de classic_algorithm.py, de modo que os dois
 algoritmos sejam comparados sob EXATAMENTE a mesma função objetivo
@@ -43,8 +46,8 @@ NOTAS DE CALIBRAÇÃO (importantes para a leitura dos resultados)
 import time as time_module
 
 import numpy as np
-from scipy.optimize import minimize
 
+from braket_dispositivo import criar_dispositivo
 from classic_algorithm import (
     avaliar,
     custo_rota,
@@ -59,7 +62,6 @@ from classic_algorithm import (
 # máquina sem o SDK instalado.
 try:
     from braket.circuits import Circuit
-    from braket.devices import LocalSimulator
 
     BRAKET_DISPONIVEL = True
     _ERRO_BRAKET = None
@@ -67,7 +69,6 @@ except ImportError as exc:  # pragma: no cover
     BRAKET_DISPONIVEL = False
     _ERRO_BRAKET = exc
     Circuit = None
-    LocalSimulator = None
 
 
 # número máximo de variáveis para o qual vale enumerar o QUBO por força
@@ -618,17 +619,48 @@ def montar_circuito_qaoa(n_vars, h, Jm, gamma, beta_ang, camadas):
     return circ
 
 
-def executar_qaoa(n_vars, h, Jm, offset, camadas=1, amostras=500,
-                  maxiter=25, seed=42, topo=64, exato=False):
-    """Loop variacional híbrido: dispara o circuito parametrizado no
-    LocalSimulator do Braket e otimiza (gamma, beta) classicamente via
-    COBYLA, replicando o Quadro 6 do TCC.
+def energias_qubo(indices, n_vars, h, Jm, offset):
+    """Energia do QUBO (na forma de Ising) de cada configuração, dada pelo
+    índice inteiro da bitstring. Vetorizada."""
+    indices = np.asarray(indices, dtype=np.int64)
+    bits = ((indices[:, None] >> np.arange(n_vars - 1, -1, -1)) & 1).astype(float)
+    z = 1.0 - 2.0 * bits
+    e = offset + z @ h
+    for a, b in np.argwhere(Jm != 0):
+        e += Jm[a, b] * z[:, a] * z[:, b]
+    return e
 
-    SELEÇÃO POR ENERGIA (e não por frequência). O circuito final é medido
-    com 'amostras' shots e as bitstrings medidas são ordenadas pela ENERGIA
-    do QUBO, da menor para a maior. Isso é a prática padrão de uso do QAOA
-    como amostrador: guarda-se a melhor amostra observada, não a moda da
-    distribuição.
+
+def normalizar_hamiltoniano(h, Jm):
+    """NORMALIZAÇÃO DO HAMILTONIANO NO CIRCUITO. Os coeficientes do QUBO
+    chegam a centenas ou milhares (as penalidades de permutação dominam),
+    e o circuito aplica fases 2*gamma*h. Com gamma sorteado em [0, pi] a
+    fase dá centenas de voltas, a paisagem do valor esperado vira ruído e o
+    otimizador de ângulos não aprende nada: medido com a distribuição exata,
+    P(permutação válida) ficava no nível do acaso (~1%) para qualquer número
+    de camadas. Dividir h e J por um escalar positivo não muda o ótimo nem a
+    ordem das energias; só coloca gamma na escala em que ele consegue
+    trabalhar. O valor esperado continua sendo calculado com as energias
+    originais.
+
+    Os ângulos salvos em disco valem para o hamiltoniano NORMALIZADO, então
+    a calibração e a medição precisam usar esta mesma função."""
+    escala = max(float(np.abs(h).max(initial=0.0)),
+                 float(np.abs(Jm).max(initial=0.0)), 1e-12)
+    return h / escala, Jm / escala
+
+
+def medir_qaoa(dispositivo, n_vars, h, Jm, offset, gamma, beta,
+               amostras=500, topo=64):
+    """Execução QUÂNTICA do QAOA com ângulos JÁ DEFINIDOS: monta o circuito,
+    mede com 'amostras' shots no 'dispositivo' (LocalSimulator ou Braket) e
+    devolve o ranking das bitstrings medidas. Não otimiza nada: de onde os
+    ângulos vêm (calibração ou arquivo) é decidido fora deste módulo.
+
+    SELEÇÃO POR ENERGIA (e não por frequência). As bitstrings medidas são
+    ordenadas pela ENERGIA do QUBO, da menor para a maior. Isso é a prática
+    padrão de uso do QAOA como amostrador: guarda-se a melhor amostra
+    observada, não a moda da distribuição.
 
     O motivo é concreto: com 200 shots sobre 2^16 = 65536 estados, TODAS as
     200 bitstrings medidas empatam na mesma frequência (1/200), e o argmax
@@ -637,68 +669,26 @@ def executar_qaoa(n_vars, h, Jm, offset, camadas=1, amostras=500,
     enquanto a seleção por energia, com as mesmas 200 medidas, dava rank
     554/65536.
 
-    'exato=True' usa a distribuição exata do vetor de estado (shots=0) para
-    avaliar o valor esperado durante a otimização — sem ruído de
-    amostragem, o que ajuda muito o COBYLA. A MEDIÇÃO FINAL continua sendo
-    amostrada com 'amostras' shots, para que a seleção não possa varrer o
-    espaço inteiro e "achar" o ótimo por força bruta disfarçada.
+    A medição é sempre amostrada, nunca exaustiva: a seleção não pode varrer
+    o espaço inteiro e "achar" o ótimo por força bruta disfarçada.
 
     Devolve (ranking, tempo), com ranking = [(bitstring, prob, energia)]
     ordenado por energia crescente e truncado em 'topo'."""
     _exigir_braket()
-    device = LocalSimulator()
-
-    def _energias(indices):
-        bits = ((indices[:, None] >> np.arange(n_vars - 1, -1, -1)) & 1).astype(float)
-        z = 1.0 - 2.0 * bits
-        e = offset + z @ h
-        for a, b in np.argwhere(Jm != 0):
-            e += Jm[a, b] * z[:, a] * z[:, b]
-        return e
-
-    shots_otim = 0 if exato else amostras
-
-    # NORMALIZAÇÃO DO HAMILTONIANO NO CIRCUITO. Os coeficientes do QUBO
-    # chegam a centenas ou milhares (as penalidades de permutação dominam),
-    # e o circuito aplica fases 2*gamma*h. Com gamma sorteado em [0, pi] a
-    # fase dá centenas de voltas, a paisagem do valor esperado vira ruído e o
-    # COBYLA não aprende nada: medido com a distribuição exata, P(permutação
-    # válida) ficava no nível do acaso (~1%) para qualquer número de camadas.
-    # Dividir h e J por um escalar positivo não muda o ótimo nem a ordem das
-    # energias; só coloca gamma na escala em que o otimizador consegue
-    # trabalhar. O valor esperado continua sendo calculado com as energias
-    # originais.
-    escala = max(float(np.abs(h).max(initial=0.0)),
-                 float(np.abs(Jm).max(initial=0.0)), 1e-12)
-    h_circ, Jm_circ = h / escala, Jm / escala
-
-    def custo_esperado(params):
-        circ = montar_circuito_qaoa(
-            n_vars, h_circ, Jm_circ, params[:camadas], params[camadas:], camadas
-        )
-        probs = np.asarray(device.run(circ, shots=shots_otim).result().values[0])
-        ativos = np.flatnonzero(probs)
-        if ativos.size == 0:
-            return 0.0
-        return float(np.dot(probs[ativos], _energias(ativos)))
-
-    rng = np.random.default_rng(seed)
-    x0 = rng.uniform(0, np.pi, size=2 * camadas)
+    h_circ, Jm_circ = normalizar_hamiltoniano(h, Jm)
+    circ = montar_circuito_qaoa(
+        n_vars, h_circ, Jm_circ, gamma, beta, len(gamma)
+    )
 
     t0 = time_module.time()
-    res = minimize(custo_esperado, x0, method="COBYLA", options={"maxiter": maxiter})
-    tempo_simulacao = time_module.time() - t0
+    probs = dispositivo.probabilidades(circ, amostras)
+    tempo = time_module.time() - t0
 
-    # medição final: sempre amostrada, nunca exaustiva
-    circ_final = montar_circuito_qaoa(
-        n_vars, h_circ, Jm_circ, res.x[:camadas], res.x[camadas:], camadas
-    )
-    probs = np.asarray(device.run(circ_final, shots=amostras).result().values[0])
     medidos = np.flatnonzero(probs)
     if medidos.size == 0:
         medidos = np.array([int(np.argmax(probs))])
 
-    energias = _energias(medidos)
+    energias = energias_qubo(medidos, n_vars, h, Jm, offset)
     ordem = np.argsort(energias)[: min(topo, medidos.size)]
     ranking = [
         (
@@ -709,7 +699,7 @@ def executar_qaoa(n_vars, h, Jm, offset, camadas=1, amostras=500,
         for i in ordem
     ]
 
-    return ranking, tempo_simulacao
+    return ranking, tempo
 
 
 # ---------------------------------------------------------------------------
@@ -881,12 +871,18 @@ def busca_local_global(rota_completa, instancia):
 # Pipeline quântico (Quadro 6 do TCC)
 # ---------------------------------------------------------------------------
 
-def resolver_quantico(instancia, K=4, camadas_qaoa=1, amostras=2000,
-                      maxiter=40, seed=42, fator_penalidade=1.3,
-                      metricas=True, exato=False, busca_local="nenhuma",
-                      construcao="auto", verbose=True):
+def resolver_quantico(instancia, provedor_angulos, dispositivo=None, K=4,
+                      amostras=2000, fator_penalidade=1.3, metricas=True,
+                      busca_local="nenhuma", construcao="auto", verbose=True):
     """Executa o pipeline de path-slicing sobre uma instância JÁ CARREGADA
     (o carregamento fica em main.py).
+
+    'provedor_angulos' é um callable que devolve os ângulos (gamma, beta) do
+    QAOA de cada fatia: ver qaoa_calibracao.py. Este módulo não otimiza
+    ângulo nenhum; só monta o circuito com os que recebe e mede. Assinatura:
+        provedor_angulos(Q, n_vars, h, Jm, offset, contexto)
+            -> (gamma, beta, tempo_quantico)
+    'dispositivo' é onde a medição roda (padrão: LocalSimulator).
 
     'busca_local' define quanta busca local CLÁSSICA entra no pipeline:
       - "nenhuma"  : nenhuma. A rota é o que o solver produziu, e só.
@@ -902,6 +898,8 @@ def resolver_quantico(instancia, K=4, camadas_qaoa=1, amostras=2000,
     if busca_local not in ("nenhuma", "fatia", "completa"):
         raise ValueError(f"busca_local inválida: {busca_local!r}")
     _exigir_braket()
+    if dispositivo is None:
+        dispositivo = criar_dispositivo(aws=False)
 
     if verbose:
         print("=" * 70)
@@ -987,12 +985,16 @@ def resolver_quantico(instancia, K=4, camadas_qaoa=1, amostras=2000,
                 f"impossíveis, {pesos['penalidades_pares']} pares proibidos"
             )
 
-        # 3) Execução quântica
-        ranking, t_sim = executar_qaoa(
-            n_vars, h, Jm, offset, camadas=camadas_qaoa,
-            amostras=amostras, maxiter=maxiter, seed=seed, exato=exato,
+        # 3) Execução quântica: ângulos (calibrados ou lidos do arquivo) +
+        # medição do circuito
+        gamma, beta, t_ang = provedor_angulos(
+            Q, n_vars, h, Jm, offset,
+            dict(fatia=fatia_ext, t_origem=t_origem),
         )
-        tempo_quantico_total += t_sim
+        ranking, t_med = medir_qaoa(
+            dispositivo, n_vars, h, Jm, offset, gamma, beta, amostras=amostras
+        )
+        tempo_quantico_total += t_ang + t_med
 
         # 4) Pós-processamento
         t0 = time_module.time()
@@ -1054,6 +1056,7 @@ def resolver_quantico(instancia, K=4, camadas_qaoa=1, amostras=2000,
                 sub_rota_decodificada=sub_rota_quantica,
                 sub_rota_refinada=sub_rota_refinada,
                 valor_fatia=valor_fatia,
+                angulos=dict(gamma=list(gamma), beta=list(beta)),
             )
         )
         rota_global.extend(sub_rota_refinada)
