@@ -8,7 +8,7 @@ módulo quântico, para que a fronteira seja fácil de auditar:
   - ProvedorCalibracao : calibra os ângulos de cada fatia com um laço
                          variacional (circuito -> valor esperado -> COBYLA)
                          e os SALVA em angulos.json;
-  - ProvedorOffline    : NÃO otimiza nada; só LÊ do angulos.json os ângulos
+  - ProvedorLookup    : NÃO otimiza nada; só LÊ do angulos.json os ângulos
                          já calibrados e levanta erro se algum faltar.
 
 O quantum_path_slicing.py recebe qualquer um dos dois como 'provedor_angulos'
@@ -18,7 +18,7 @@ Cada entrada do arquivo é identificada por um hash dos coeficientes do QUBO
 (mais o número de camadas): os ângulos só valem para o problema para o qual
 foram calibrados. Se a fatia mudar — outra instância, outro K, outra
 penalidade, ou um t_origem diferente porque a fatia anterior decodificou
-outra ordem —, o hash muda e o modo offline recusa em vez de usar ângulos
+outra ordem —, o hash muda e o modo lookup recusa em vez de usar ângulos
 que não casam.
 """
 
@@ -42,7 +42,7 @@ VERSAO_ARQUIVO = 1
 
 
 class AngulosNaoEncontradosError(RuntimeError):
-    """O modo offline não achou ângulos salvos para a fatia."""
+    """O modo lookup não achou ângulos salvos para a fatia."""
 
 
 # ---------------------------------------------------------------------------
@@ -167,11 +167,11 @@ class ProvedorCalibracao:
         return gamma, beta, tempo
 
 
-class ProvedorOffline:
+class ProvedorLookup:
     """Lê os ângulos já calibrados. Não otimiza nada e não tem plano B: se a
     fatia não estiver no arquivo, levanta AngulosNaoEncontradosError."""
 
-    modo = "offline"
+    modo = "lookup"
 
     def __init__(self, caminho=ARQUIVO_PADRAO, camadas=1):
         self.caminho = caminho
@@ -180,7 +180,7 @@ class ProvedorOffline:
         if not self.angulos:
             raise AngulosNaoEncontradosError(
                 f"Nenhum ângulo salvo em {caminho!r}. Rode primeiro sem "
-                f"--offline para calibrar e gerar o arquivo."
+                f"--lookup para calibrar e gerar o arquivo."
             )
 
     def __call__(self, Q, n_vars, h, Jm, offset, contexto):
@@ -193,6 +193,6 @@ class ProvedorOffline:
                 f"{self.camadas} camada(s), chave {chave}) em "
                 f"{str(self.caminho)!r}. O QUBO desta fatia difere do que foi "
                 f"calibrado (outra instância/parâmetro, ou a fatia anterior "
-                f"decodificou outra ordem). Rode sem --offline para recalibrar."
+                f"decodificou outra ordem). Rode sem --lookup para recalibrar."
             )
         return entrada["gamma"], entrada["beta"], 0.0

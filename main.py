@@ -20,11 +20,11 @@ Uso:
     python main.py --algorithm quantico  --clientes 6 --K 4 --camadas 1
 
 Ângulos do QAOA (gamma, beta):
-    sem --offline   calibra com COBYLA e salva em angulos.json
-    --offline       só LÊ os ângulos do angulos.json (erro se faltar algum)
+    sem --lookup   calibra com COBYLA e salva em angulos.json
+    --lookup       só LÊ os ângulos do angulos.json (erro se faltar algum)
     --AWS           roda os circuitos no Amazon Braket (SV1) em vez do
                     LocalSimulator; configuração no arquivo .env
-    --AWS sem --offline é o modo mais caro (o laço COBYLA roda na AWS) e
+    --AWS sem --lookup é o modo mais caro (o laço COBYLA roda na AWS) e
     pede confirmação.
 
 Requisitos:
@@ -300,6 +300,26 @@ def relatar(resultado, instancia):
     print(f"Tempo Simulação Quântica (TSQ): {resultado['tsq']:.3f} s")
     print(f"Tempo Total de Execução (TTE):  {resultado['tte']:.3f} s")
 
+    if resultado.get("dispositivo"):
+        _relatar_dispositivo(resultado["dispositivo"])
+
+
+def _relatar_dispositivo(disp):
+    """Tempo de execução no simulador, como reportado pelo próprio serviço
+    nos metadados das tarefas. O TSQ acima é tempo de RELÓGIO: na AWS
+    inclui rede, fila e download, então é bem maior que este. O
+    LocalSimulator não reporta o campo, e nesse caso nada é impresso."""
+    if disp["execucao_s"] is not None:
+        print(
+            f"Execução no simulador ({disp['nome']}, {disp['tarefas']} "
+            f"tarefa(s)): {disp['execucao_s']:.3f} s"
+        )
+    elif disp["nome"].startswith("AWS"):
+        print(
+            f"Execução no simulador ({disp['nome']}): não reportada nos "
+            f"metadados da tarefa"
+        )
+
 
 def _relatar_diagnostico_quantico(resultado):
     """Métricas que mostram o quanto a etapa quântica de fato contribuiu.
@@ -432,7 +452,7 @@ def estimar_custo_aws(instancia, K, maxiter):
 
 
 def confirmar_modo_caro(estimativa, assumir_sim=False):
-    """Aviso + confirmação do modo mais caro (--AWS sem --offline). A
+    """Aviso + confirmação do modo mais caro (--AWS sem --lookup). A
     resposta padrão (Enter) é NÃO. Sem terminal interativo não há como
     perguntar, então recusa — a menos que --yes tenha sido passado."""
     print("=" * 70)
@@ -442,7 +462,7 @@ def confirmar_modo_caro(estimativa, assumir_sim=False):
         f"fatia(s), ~{estimativa['minutos']:.1f} min faturados, "
         f"~US$ {estimativa['usd']:.2f} no SV1 (antes da camada gratuita)."
     )
-    print("    Para calibrar de graça: rode sem --AWS e depois use --AWS --offline.")
+    print("    Para calibrar de graça: rode sem --AWS e depois use --AWS --lookup.")
     print("=" * 70)
     if assumir_sim:
         print("--yes informado: confirmação dispensada.")
@@ -530,7 +550,7 @@ def montar_parser():
         ),
     )
     g.add_argument(
-        "--offline", action="store_true",
+        "--lookup", action="store_true",
         help=(
             "não calibra: lê os ângulos (gamma, beta) já salvos em --angulos "
             "e levanta erro se faltar algum. Sem esta flag, calibra com "
@@ -541,13 +561,13 @@ def montar_parser():
         "--AWS", dest="aws", action="store_true",
         help=(
             "roda os circuitos no Amazon Braket (SV1) em vez do "
-            "LocalSimulator; configuração no .env. Sem --offline é o modo "
+            "LocalSimulator; configuração no .env. Sem --lookup é o modo "
             "mais caro e pede confirmação"
         ),
     )
     g.add_argument(
         "--yes", dest="yes", action="store_true",
-        help="aprova de antemão a confirmação do modo caro (--AWS sem --offline)",
+        help="aprova de antemão a confirmação do modo caro (--AWS sem --lookup)",
     )
     g.add_argument(
         "--angulos", default=calibracao.ARQUIVO_PADRAO,
@@ -623,7 +643,7 @@ def main(argv=None):
         print()
 
         # modo mais caro: o laço COBYLA rodando na AWS
-        if args.aws and not args.offline:
+        if args.aws and not args.lookup:
             estimativa = estimar_custo_aws(instancia, args.K, args.maxiter)
             if not confirmar_modo_caro(estimativa, assumir_sim=args.yes):
                 print("Execução cancelada.")
@@ -631,8 +651,8 @@ def main(argv=None):
 
         try:
             dispositivo = criar_dispositivo(aws=args.aws)
-            if args.offline:
-                provedor = calibracao.ProvedorOffline(args.angulos, args.camadas)
+            if args.lookup:
+                provedor = calibracao.ProvedorLookup(args.angulos, args.camadas)
             else:
                 provedor = calibracao.ProvedorCalibracao(
                     dispositivo, args.angulos, camadas=args.camadas,
@@ -645,7 +665,7 @@ def main(argv=None):
         print(f"Dispositivo: {dispositivo.nome}")
         print(
             "Ângulos:     "
-            + (f"lidos de {args.angulos} (offline)" if args.offline
+            + (f"lidos de {args.angulos} (lookup)" if args.lookup
                else f"calibrados com COBYLA e salvos em {args.angulos}")
         )
         print()

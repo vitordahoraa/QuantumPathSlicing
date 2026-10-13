@@ -900,6 +900,7 @@ def resolver_quantico(instancia, provedor_angulos, dispositivo=None, K=4,
     _exigir_braket()
     if dispositivo is None:
         dispositivo = criar_dispositivo(aws=False)
+    base_dispositivo = dispositivo.instantaneo()
 
     if verbose:
         print("=" * 70)
@@ -1126,6 +1127,11 @@ def resolver_quantico(instancia, provedor_angulos, dispositivo=None, K=4,
             taxa_posicoes_qaoa=posicoes_qaoa / posicoes_tot,
             razao_aproximacao_media=(float(np.mean(razoes)) if razoes else None),
             otimos_qubo_invalidos=otimos_invalidos,
+        ),
+        # tempos medidos pelo próprio dispositivo (metadados das tarefas),
+        # distintos do tsq, que é tempo de relógio e inclui rede e fila
+        dispositivo=dict(
+            nome=dispositivo.nome, **dispositivo.desde(base_dispositivo)
         ),
         tcl=tempo_classico_total,
         tsq=tempo_quantico_total,

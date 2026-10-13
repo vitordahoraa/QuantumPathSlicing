@@ -52,17 +52,49 @@ def carregar_env(caminho=None):
 
 class DispositivoBraket:
     """Interface única para os dois tipos de dispositivo: devolve o vetor de
-    probabilidades das 2^n bitstrings de um circuito."""
+    probabilidades das 2^n bitstrings de um circuito.
+
+    Também soma o TEMPO DE EXECUÇÃO NO SIMULADOR que o próprio serviço
+    reporta nos metadados do resultado (simulatorMetadata.executionDuration,
+    em milissegundos). É só o tempo de simulação: não inclui rede, fila,
+    nem gravação/download do resultado, que entram no tempo de relógio
+    medido por quem chama. O LocalSimulator não reporta esse campo."""
 
     def __init__(self, device, nome, s3=None):
         self.device = device
         self.nome = nome
         self.s3 = s3  # (bucket, prefixo) — só para dispositivos AWS
+        self.tarefas = 0
+        self.tarefas_com_execucao = 0
+        self.execucao_s = 0.0
 
     def probabilidades(self, circ, shots):
         kwargs = {"s3_destination_folder": self.s3} if self.s3 else {}
         tarefa = self.device.run(circ, shots=shots, **kwargs)
-        return np.asarray(tarefa.result().values[0])
+        resultado = tarefa.result()
+
+        self.tarefas += 1
+        sim = getattr(resultado.additional_metadata, "simulatorMetadata", None)
+        ms = getattr(sim, "executionDuration", None)
+        if ms is not None:
+            self.tarefas_com_execucao += 1
+            self.execucao_s += float(ms) / 1000.0
+
+        return np.asarray(resultado.values[0])
+
+    def instantaneo(self):
+        """Contadores atuais, para medir um trecho com desde()."""
+        return (self.tarefas, self.tarefas_com_execucao, self.execucao_s)
+
+    def desde(self, base):
+        """Tarefas e tempo de execução acumulados desde o instantâneo 'base'.
+        'execucao_s' é None se nenhuma tarefa do trecho reportou o tempo."""
+        tarefas, com_exec, exec_s = base
+        reportou = self.tarefas_com_execucao - com_exec > 0
+        return dict(
+            tarefas=self.tarefas - tarefas,
+            execucao_s=(self.execucao_s - exec_s) if reportou else None,
+        )
 
 
 def criar_dispositivo(aws=False):
