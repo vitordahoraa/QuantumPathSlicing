@@ -1,0 +1,2 @@
+﻿instancia,nos,algoritmo,busca_local,seed,rota,distancia_total,violacao_janelas,viavel,caminho_percorrido,tempos_chegada,ultimo_no_visitado,distancia_percorrida,nos_nao_visitados,qtd_nos_nao_visitados,retorno_deposito,tcl_s,tsq_s,tte_s,dispositivo,execucao_simulador_s,decodificacoes_validas,fatias,taxa_posicoes_qaoa,razao_aproximacao_media,gap_pct_vs_classico
+rc_206.1.txt,4,classico,,42,"[0, 2, 1, 3]",87.85,0.0,sim,"[0, 2, 1, 3, 0]",0@0.0; 2@36.1; 1@53.1; 3@74.3,3,87.85,[],0,117.8,0.121,0.0,0.121,,,,,,,

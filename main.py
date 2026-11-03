@@ -55,8 +55,10 @@ tempos de viagem puros — simétrica, como esperado.
 """
 
 import argparse
+import csv
 import os
 import sys
+from datetime import datetime
 
 import numpy as np
 
@@ -427,6 +429,110 @@ def comparar(res_classico, res_quantico):
 
 
 # ---------------------------------------------------------------------------
+# Exportação CSV
+# ---------------------------------------------------------------------------
+
+PASTA_RESULTADOS = "results"
+
+COLUNAS_CSV = [
+    "instancia", "nos", "algoritmo", "busca_local", "seed", "rota",
+    "distancia_total", "violacao_janelas", "viavel",
+    "caminho_percorrido", "tempos_chegada", "ultimo_no_visitado",
+    "distancia_percorrida", "nos_nao_visitados", "qtd_nos_nao_visitados",
+    "retorno_deposito", "tcl_s", "tsq_s", "tte_s",
+    "dispositivo", "execucao_simulador_s",
+    "decodificacoes_validas", "fatias", "taxa_posicoes_qaoa",
+    "razao_aproximacao_media", "gap_pct_vs_classico",
+]
+
+
+def caminho_saida(nome):
+    """Resolve --output para <pasta do script>/results/<nome>.csv. Só o
+    nome-base é usado, então o arquivo sempre cai dentro de results/."""
+    nome = os.path.basename(str(nome))
+    if not nome.lower().endswith(".csv"):
+        nome += ".csv"
+    return os.path.join(RAIZ_SCRIPT, PASTA_RESULTADOS, nome)
+
+
+def _linha_csv(resultado, instancia, args, caminho_instancia, gap=None):
+    """Mesmos dados que `relatar` imprime, em uma linha plana."""
+    percurso = resultado["percurso"]
+    caminho = list(percurso["percorrido"])
+    if not percurso["inviavel"]:
+        caminho = caminho + [resultado["rota"][0]]
+    resumo = resultado.get("resumo_quantico") or {}
+    disp = resultado.get("dispositivo") or {}
+    quantico_ = resultado["algoritmo"] == "quantico"
+    nao_visitados = percurso["nao_visitados"] if percurso["inviavel"] else []
+
+    return {
+        "instancia": os.path.basename(caminho_instancia),
+        "nos": instancia["n"],
+        "algoritmo": resultado["algoritmo"],
+        "busca_local": resultado["busca_local"] if quantico_ else "",
+        "seed": args.seed,
+        "rota": list(resultado["rota"]),
+        "distancia_total": round(resultado["custo"], 2),
+        "violacao_janelas": round(resultado["violacao"], 2),
+        "viavel": "sim" if resultado["viavel"] else "não",
+        "caminho_percorrido": caminho,
+        "tempos_chegada": "; ".join(
+            f"{no}@{t:.1f}" for no, t in zip(percurso["percorrido"], percurso["tempos"])
+        ),
+        "ultimo_no_visitado": percurso["percorrido"][-1],
+        "distancia_percorrida": round(classico.custo_rota(caminho, instancia["C"]), 2),
+        "nos_nao_visitados": list(nao_visitados),
+        "qtd_nos_nao_visitados": len(nao_visitados),
+        "retorno_deposito": (
+            "" if percurso["inviavel"] else round(percurso["retorno_deposito"], 1)
+        ),
+        "tcl_s": round(resultado["tcl"], 3),
+        "tsq_s": round(resultado["tsq"], 3),
+        "tte_s": round(resultado["tte"], 3),
+        "dispositivo": disp.get("nome", ""),
+        "execucao_simulador_s": (
+            "" if disp.get("execucao_s") is None else round(disp["execucao_s"], 3)
+        ),
+        "decodificacoes_validas": resumo.get("decodificacoes_validas", ""),
+        "fatias": resumo.get("fatias", ""),
+        "taxa_posicoes_qaoa": (
+            "" if not resumo else round(resumo["taxa_posicoes_qaoa"], 4)
+        ),
+        "razao_aproximacao_media": (
+            "" if resumo.get("razao_aproximacao_media") is None
+            else round(resumo["razao_aproximacao_media"], 4)
+        ),
+        "gap_pct_vs_classico": "" if gap is None else round(gap, 2),
+    }
+
+
+def salvar_csv(nome, resultados, instancia, args, caminho_instancia):
+    """Grava uma linha por algoritmo executado em results/<nome>.csv. Se o
+    arquivo já existir, as linhas são acrescentadas (o cabeçalho só é
+    escrito em arquivo novo)."""
+    destino = caminho_saida(nome)
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+
+    gap = None
+    cl, qu = resultados.get("classico"), resultados.get("quantico")
+    if cl and qu and cl["custo"] > 0:
+        gap = (qu["custo"] - cl["custo"]) / cl["custo"] * 100
+
+    novo = not os.path.isfile(destino) or os.path.getsize(destino) == 0
+    with open(destino, "a", newline="", encoding="utf-8-sig") as arq:
+        escritor = csv.DictWriter(arq, fieldnames=COLUNAS_CSV)
+        if novo:
+            escritor.writeheader()
+        for chave, res in resultados.items():
+            escritor.writerow(_linha_csv(
+                res, instancia, args, caminho_instancia,
+                gap=gap if chave == "quantico" else None,
+            ))
+    return destino
+
+
+# ---------------------------------------------------------------------------
 # Custo na AWS
 # ---------------------------------------------------------------------------
 
@@ -514,6 +620,14 @@ def montar_parser():
     p.add_argument(
         "--clientes", "-c", type=int, default=4,
         help="recorte: nº de clientes após o depósito (padrão: 4; use 0 para todos)",
+    )
+    p.add_argument(
+        "--output", "-o", default=None,
+        help=(
+            "nome do CSV com os resultados, salvo em results/ (a extensão "
+            ".csv é opcional; linhas são acrescentadas se o arquivo já "
+            "existir). Padrão: <instância>_<algoritmo>_<data-hora>.csv"
+        ),
     )
     p.add_argument("--seed", type=int, default=42, help="semente aleatória (padrão: 42)")
     p.add_argument("--quiet", "-q", action="store_true", help="suprime o log de progresso")
@@ -694,6 +808,17 @@ def main(argv=None):
     # 3) Comparação
     if args.algorithm == "ambos":
         comparar(res_classico, res_quantico)
+
+    # 4) Exportação CSV
+    resultados = {
+        k: r for k, r in (("classico", res_classico), ("quantico", res_quantico)) if r
+    }
+    nome = args.output or (
+        f"{os.path.splitext(os.path.basename(caminho))[0]}_{args.algorithm}_"
+        f"{datetime.now():%Y%m%d-%H%M%S}"
+    )
+    destino = salvar_csv(nome, resultados, instancia, args, caminho)
+    print(f"\nResultados salvos em: {destino}")
 
     return 0
 
